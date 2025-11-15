@@ -18,15 +18,14 @@
 - 📊 Theo dõi tiến độ qua dashboard thống kê
 - ✅ Quản lý subtasks và checklist chi tiết
 - 🔍 Tìm kiếm và lọc tasks nhanh chóng
-- 🎨 Giao diện hiện đại, responsive
+- 🎨 Giao diện đơn giản, dễ sử dụng
 
 ---
 
 ## ✨ Tính năng
 
 ### 🔐 Xác thực người dùng
-- Đăng ký/Đăng nhập với validation
-- Upload và quản lý avatar cá nhân
+- Đăng ký/Đăng nhập với 
 - Session management an toàn
 
 ### 📊 Dashboard thống kê
@@ -98,7 +97,7 @@
 **Frontend:**
 - Bootstrap 5
 - Font Awesome
-- Vanilla JavaScript + AJAX
+- JavaScript + AJAX
 
 ---
 
@@ -269,8 +268,6 @@ if __name__ == '__main__':
 
 <div align="center">
 
-**Phiên bản:** 2.0  
-**Cập nhật lần cuối:** 2025
 
 
 </div>
