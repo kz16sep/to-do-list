@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -75,11 +75,52 @@ def load_user(user_id):
 @app.route('/')
 @login_required
 def index():
-    # Lấy tất cả tasks của user hiện tại
-    tasks = Task.query.filter_by(user_id=current_user.id).all()
+    # Lấy query parameters cho search và filter
+    search_query = request.args.get('search', '').strip()
+    status_filter = request.args.get('status', 'all')
+    priority_filter = request.args.get('priority', 'all')
+    sort_by = request.args.get('sort', 'due_date')
     
-    # Tính toán chi tiết về tasks trễ hạn
+    # Base query
+    query = Task.query.filter_by(user_id=current_user.id)
+    
+    # Apply search filter
+    if search_query:
+        query = query.filter(
+            (Task.title.contains(search_query)) |
+            (Task.description.contains(search_query))
+        )
+    
+    # Apply status filter
+    if status_filter != 'all':
+        query = query.filter(Task.status == status_filter)
+    
+    # Apply priority filter
+    if priority_filter != 'all':
+        query = query.filter(Task.priority == priority_filter)
+    
+    # Apply sorting
+    if sort_by == 'due_date':
+        query = query.order_by(Task.due_date.asc())
+    elif sort_by == 'priority':
+        priority_order = {'high': 1, 'medium': 2, 'low': 3}
+        query = query.order_by(Task.priority.asc())
+    elif sort_by == 'created':
+        query = query.order_by(Task.created_at.desc())
+    elif sort_by == 'title':
+        query = query.order_by(Task.title.asc())
+    
+    tasks = query.all()
+    
+    # Tính toán dashboard statistics
     now = datetime.now()
+    all_tasks = Task.query.filter_by(user_id=current_user.id).all()
+    
+    total_tasks = len(all_tasks)
+    pending_tasks = len([t for t in all_tasks if t.status == 'pending'])
+    in_progress_tasks = len([t for t in all_tasks if t.status == 'in_progress'])
+    completed_tasks = len([t for t in all_tasks if t.status == 'completed'])
+    
     overdue_tasks = Task.query.filter(
         Task.user_id == current_user.id,
         Task.status != 'completed',
@@ -103,12 +144,25 @@ def index():
         'today': len(today_overdue)
     }
     
+    dashboard_stats = {
+        'total': total_tasks,
+        'pending': pending_tasks,
+        'in_progress': in_progress_tasks,
+        'completed': completed_tasks,
+        'overdue': overdue_stats['total']
+    }
+    
     return render_template('index.html', 
                          tasks=tasks, 
                          overdue_stats=overdue_stats,
+                         dashboard_stats=dashboard_stats,
                          critical_overdue=critical_overdue,
                          today_overdue=today_overdue,
-                         now=now)
+                         now=now,
+                         search_query=search_query,
+                         status_filter=status_filter,
+                         priority_filter=priority_filter,
+                         sort_by=sort_by)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -128,6 +182,20 @@ def register():
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
+        confirm_password = request.form.get('confirm_password')
+        
+        # Validation
+        if not username or len(username) < 3:
+            flash('Username must be at least 3 characters long')
+            return redirect(url_for('register'))
+        
+        if not password or len(password) < 6:
+            flash('Password must be at least 6 characters long')
+            return redirect(url_for('register'))
+        
+        if password != confirm_password:
+            flash('Passwords do not match')
+            return redirect(url_for('register'))
         
         if User.query.filter_by(username=username).first():
             flash('Username already exists')
@@ -140,6 +208,7 @@ def register():
         )
         db.session.add(user)
         db.session.commit()
+        flash('Registration successful! Please login.')
         return redirect(url_for('login'))
     return render_template('register.html')
 
@@ -286,6 +355,56 @@ def create_test_tasks():
         db.session.rollback()
     
     return redirect(url_for('index'))
+
+@app.route('/edit_task/<int:task_id>', methods=['GET', 'POST'])
+@login_required
+def edit_task(task_id):
+    task = Task.query.get_or_404(task_id)
+    if task.user_id != current_user.id:
+        flash('Unauthorized action')
+        return redirect(url_for('index'))
+    
+    if request.method == 'POST':
+        try:
+            task.title = request.form.get('title')
+            task.description = request.form.get('description')
+            task.due_date = datetime.strptime(request.form.get('due_date'), '%Y-%m-%dT%H:%M')
+            
+            hours = int(request.form.get('hours', 0))
+            minutes = int(request.form.get('minutes', 0))
+            task.estimated_hours = hours + (minutes / 60)
+            
+            task.priority = request.form.get('priority', 'medium')
+            task.status = request.form.get('status', task.status)
+            
+            if task.status == 'completed' and not task.finished_at:
+                task.finished_at = datetime.utcnow()
+            elif task.status != 'completed':
+                task.finished_at = None
+            
+            db.session.commit()
+            flash('Task updated successfully')
+        except Exception as e:
+            flash(f'Error updating task: {str(e)}')
+            db.session.rollback()
+        
+        return redirect(url_for('index'))
+    
+    # GET request - return task data as JSON for modal
+    total_minutes = int(task.estimated_hours * 60)
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    
+    return jsonify({
+        'id': task.id,
+        'title': task.title,
+        'description': task.description or '',
+        'due_date': task.due_date.strftime('%Y-%m-%dT%H:%M'),
+        'estimated_hours': hours,
+        'estimated_minutes': minutes,
+        'priority': task.priority,
+        'status': task.status
+    })
 
 @app.route('/delete_task/<int:task_id>', methods=['POST'])
 @login_required
