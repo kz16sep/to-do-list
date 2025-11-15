@@ -7,9 +7,9 @@ from datetime import datetime, timedelta
 import os
 from PIL import Image
 
-# Xóa database cũ nếu tồn tại
-if os.path.exists('tasks.db'):
-    os.remove('tasks.db')
+# Xóa database cũ nếu tồn tại (chỉ khi cần reset)
+# if os.path.exists('tasks.db'):
+#     os.remove('tasks.db')
 
 # Khởi tạo app và database
 app = Flask(__name__)
@@ -46,6 +46,7 @@ class Task(db.Model):
     estimated_hours = db.Column(db.Float, nullable=False, default=1.0)
     priority = db.Column(db.String(20), default='medium')
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    subtasks = db.relationship('Subtask', backref='task', lazy=True, cascade='all, delete-orphan', order_by='Subtask.id')
 
     @property
     def priority_color(self):
@@ -66,6 +67,23 @@ class Task(db.Model):
             return 'in_progress'
         else:
             return 'pending'
+    
+    @property
+    def subtasks_completed_count(self):
+        """Đếm số subtasks đã hoàn thành"""
+        return len([st for st in self.subtasks if st.completed])
+    
+    @property
+    def subtasks_total_count(self):
+        """Tổng số subtasks"""
+        return len(self.subtasks)
+
+class Subtask(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    completed = db.Column(db.Boolean, default=False)
+    task_id = db.Column(db.Integer, db.ForeignKey('task.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -110,7 +128,9 @@ def index():
     elif sort_by == 'title':
         query = query.order_by(Task.title.asc())
     
-    tasks = query.all()
+    # Eager load subtasks để tránh N+1 query
+    from sqlalchemy.orm import joinedload
+    tasks = query.options(joinedload(Task.subtasks)).all()
     
     # Tính toán dashboard statistics
     now = datetime.now()
@@ -257,6 +277,12 @@ def add_task():
         # Lấy giờ và phút từ form
         hours = int(request.form.get('hours', 0))
         minutes = int(request.form.get('minutes', 0))
+        
+        # Validation: Phải có ít nhất 1 phút
+        if hours == 0 and minutes == 0:
+            flash('Estimated time must be at least 1 minute')
+            return redirect(url_for('index'))
+        
         estimated_hours = hours + (minutes / 60)  # Chuyển đổi thành giờ
             
         priority = request.form.get('priority', 'medium')
@@ -271,6 +297,27 @@ def add_task():
             user_id=current_user.id
         )
         db.session.add(task)
+        db.session.flush()  # Flush để lấy task.id
+        
+        # Xử lý subtasks nếu có
+        subtasks_json = request.form.get('subtasks', '[]')
+        if subtasks_json and subtasks_json != '[]':
+            import json
+            try:
+                subtasks_data = json.loads(subtasks_json)
+                if isinstance(subtasks_data, list):
+                    for subtask_data in subtasks_data:
+                        if subtask_data.get('title', '').strip():
+                            subtask = Subtask(
+                                title=subtask_data['title'].strip(),
+                                completed=subtask_data.get('completed', False),
+                                task_id=task.id
+                            )
+                            db.session.add(subtask)
+            except (json.JSONDecodeError, TypeError) as e:
+                print(f"Error parsing subtasks JSON: {e}")
+                pass  # Ignore invalid JSON
+        
         db.session.commit()
         flash('Task added successfully')
     except Exception as e:
@@ -284,13 +331,29 @@ def add_task():
 def update_task_status(task_id):
     task = Task.query.get_or_404(task_id)
     if task.user_id != current_user.id:
+        if request.is_json:
+            return jsonify({'error': 'Unauthorized'}), 403
         return redirect(url_for('index'))
     
-    task.status = request.form.get('status')
-    if task.status == 'completed':
+    new_status = request.form.get('status') or (request.json.get('status') if request.is_json else None)
+    task.status = new_status
+    
+    if new_status == 'completed':
         task.finished_at = datetime.utcnow()
+        # Tự động đánh dấu tất cả subtasks là completed
+        for subtask in task.subtasks:
+            subtask.completed = True
     
     db.session.commit()
+    
+    if request.is_json:
+        return jsonify({
+            'success': True,
+            'status': task.status,
+            'subtasks_completed': task.subtasks_completed_count,
+            'subtasks_total': task.subtasks_total_count
+        })
+    
     flash('Task status updated')
     return redirect(url_for('index'))
 
@@ -372,6 +435,12 @@ def edit_task(task_id):
             
             hours = int(request.form.get('hours', 0))
             minutes = int(request.form.get('minutes', 0))
+            
+            # Validation: Phải có ít nhất 1 phút
+            if hours == 0 and minutes == 0:
+                flash('Estimated time must be at least 1 minute')
+                return redirect(url_for('index'))
+            
             task.estimated_hours = hours + (minutes / 60)
             
             task.priority = request.form.get('priority', 'medium')
@@ -395,6 +464,12 @@ def edit_task(task_id):
     hours = total_minutes // 60
     minutes = total_minutes % 60
     
+    subtasks_data = [{
+        'id': st.id,
+        'title': st.title,
+        'completed': st.completed
+    } for st in task.subtasks]
+    
     return jsonify({
         'id': task.id,
         'title': task.title,
@@ -403,7 +478,8 @@ def edit_task(task_id):
         'estimated_hours': hours,
         'estimated_minutes': minutes,
         'priority': task.priority,
-        'status': task.status
+        'status': task.status,
+        'subtasks': subtasks_data
     })
 
 @app.route('/delete_task/<int:task_id>', methods=['POST'])
@@ -411,22 +487,109 @@ def edit_task(task_id):
 def delete_task(task_id):
     task = Task.query.get_or_404(task_id)
     if task.user_id != current_user.id:
+        if request.is_json:
+            return jsonify({'error': 'Unauthorized'}), 403
         flash('Unauthorized action')
         return redirect(url_for('index'))
     
     try:
+        task_title = task.title
         db.session.delete(task)
         db.session.commit()
+        
+        if request.is_json:
+            return jsonify({'success': True, 'message': f'Task "{task_title}" deleted successfully'})
+        
         flash('Task deleted successfully')
     except Exception as e:
+        if request.is_json:
+            return jsonify({'error': str(e)}), 500
         flash(f'Error deleting task: {str(e)}')
         db.session.rollback()
     
     return redirect(url_for('index'))
 
+# Subtask routes
+@app.route('/add_subtask/<int:task_id>', methods=['POST'])
+@login_required
+def add_subtask(task_id):
+    task = Task.query.get_or_404(task_id)
+    if task.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    try:
+        title = request.json.get('title', '').strip()
+        if not title:
+            return jsonify({'error': 'Subtask title is required'}), 400
+        
+        subtask = Subtask(
+            title=title,
+            task_id=task_id
+        )
+        db.session.add(subtask)
+        db.session.commit()
+        
+        return jsonify({
+            'id': subtask.id,
+            'title': subtask.title,
+            'completed': subtask.completed
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/toggle_subtask/<int:subtask_id>', methods=['POST'])
+@login_required
+def toggle_subtask(subtask_id):
+    subtask = Subtask.query.get_or_404(subtask_id)
+    task = subtask.task
+    
+    if task.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    try:
+        subtask.completed = not subtask.completed
+        db.session.commit()
+        
+        return jsonify({
+            'id': subtask.id,
+            'completed': subtask.completed,
+            'completed_count': task.subtasks_completed_count,
+            'total_count': task.subtasks_total_count
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/delete_subtask/<int:subtask_id>', methods=['POST'])
+@login_required
+def delete_subtask(subtask_id):
+    subtask = Subtask.query.get_or_404(subtask_id)
+    task = subtask.task
+    
+    if task.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    try:
+        db.session.delete(subtask)
+        db.session.commit()
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
 # Tạo tất cả bảng trong database
 with app.app_context():
     db.create_all()
+    # Đảm bảo tất cả bảng đã được tạo, bao gồm Subtask
+    from sqlalchemy import inspect
+    inspector = inspect(db.engine)
+    tables = inspector.get_table_names()
+    print(f"Database tables: {tables}")
+    if 'subtask' not in tables:
+        print("WARNING: Subtask table not found! Recreating database...")
+        db.drop_all()
+        db.create_all()
 
 if __name__ == '__main__':
     app.run(debug=True) 
